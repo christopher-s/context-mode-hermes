@@ -533,8 +533,9 @@ def _post_tool_call(
     duration_ms: int = 0,
     **_kwargs,
 ) -> None:
-    """post_tool_call hook: observational logging for byte accounting and
-    redirect tracking. Does not modify results.
+    """post_tool_call hook: observational logging for byte accounting,
+    redirect tracking, and forwarding events to upstream context-mode
+    for SessionDB tracking.
     """
     if not session_id:
         return
@@ -572,6 +573,35 @@ def _post_tool_call(
         except ValueError:
             pass
 
+    # ── Forward to upstream SessionDB ──
+    # By piping the tool result to context-mode's native posttooluse hook
+    # masquerading as 'claude-code', we inherit the full SQLite SessionDB 
+    # tracking without reinventing it in Python.
+    try:
+        import subprocess
+        import json
+        
+        payload = json.dumps({
+            "tool_name": tool_name,
+            "tool_input": args,
+            "tool_response": result
+        })
+        
+        env = dict(os.environ)
+        env["CLAUDE_SESSION_ID"] = session_id
+        env["CLAUDE_PROJECT_DIR"] = os.getcwd()
+        
+        subprocess.run(
+            ["context-mode", "hook", "claude-code", "posttooluse"],
+            input=payload,
+            text=True,
+            env=env,
+            timeout=2,
+            capture_output=True
+        )
+    except Exception as exc:
+        logger.debug("[context-mode] failed to forward event to SessionDB: %s", exc)
+
 
 # ─── PreLLMCall hook ───────────────────────────────────────────────────────────
 
@@ -593,11 +623,37 @@ def _pre_llm_call(
     if not _check_context_mode():
         return None
 
-    if not is_first_turn:
-        return None
+    is_resume = _kwargs.get("is_resume", False)
+    
+    # First turn of a fresh session OR resuming an existing session:
+    if is_first_turn or is_resume:
+        # Avoid duplicate injection on resumes where turn=1 again
+        marker = _marker_path("injected", session_id)
+        if os.path.exists(marker):
+            return None
+            
+        logger.debug("[context-mode] triggering SessionStart logic for session %s (resume=%s)", session_id, is_resume)
+        
+        # Read upstream SessionDB routing instructions and auto-memory
+        upstream_context = _trigger_session_start(session_id, is_resume)
+        
+        # If upstream failed or returned empty, fallback to the baked-in block
+        block = upstream_context if upstream_context else ROUTING_BLOCK
+        
+        _write_marker(marker, "1")
+        return {"context": block}
 
-    logger.debug("[context-mode] injecting routing block for session %s", session_id)
-    return {"context": ROUTING_BLOCK}
+    # Intervene on commands attempting to format the model's knowledge base
+    msg = user_message.lower().strip()
+    if msg in ("/clear", "/compact", "clear", "compact"):
+        return {
+            "context": (
+                "After /clear or /compact: knowledge base preserved. Tell the user: "
+                '"context-mode knowledge base preserved. Use `ctx purge` to start fresh."'
+            )
+        }
+
+    return None
 
 
 # ─── Session lifecycle hooks ───────────────────────────────────────────────────
@@ -616,6 +672,38 @@ def _on_session_reset(*, session_id: str = "", **_kwargs) -> None:
     if session_id:
         _reset_guidance(session_id)
         logger.debug("[context-mode] cleared guidance markers on reset for session %s", session_id)
+
+
+def _trigger_session_start(session_id: str, is_resume: bool) -> str:
+    """Trigger upstream SessionStart to generate auto-injection logic."""
+    try:
+        import subprocess
+        import json
+        
+        env = dict(os.environ)
+        env["CLAUDE_SESSION_ID"] = session_id
+        env["CLAUDE_PROJECT_DIR"] = os.getcwd()
+        
+        # 'startup' for fresh sessions, 'resume' for continued sessions
+        source = "resume" if is_resume else "startup"
+        payload = json.dumps({"source": source})
+        
+        result = subprocess.run(
+            ["context-mode", "hook", "claude-code", "sessionstart"],
+            input=payload,
+            text=True,
+            env=env,
+            timeout=2,
+            capture_output=True
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            if "hookSpecificOutput" in data and "additionalContext" in data["hookSpecificOutput"]:
+                return data["hookSpecificOutput"]["additionalContext"]
+    except Exception as exc:
+        logger.debug("[context-mode] failed to trigger SessionStart: %s", exc)
+    
+    return ""
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
