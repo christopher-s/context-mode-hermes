@@ -7,7 +7,7 @@ for sandboxed execution, achieving up to 98% context window savings.
 Hooks:
   pre_tool_call   — Blocks curl/wget (with nuance), inline HTTP, build tools;
                     guides on high-output Bash; nudges large reads.
-  post_tool_call  — Observational: logs redirect events for byte accounting.
+  post_tool_call  — Observational: reads redirect/latency markers, logs events.
   pre_llm_call    — Injects routing rules on first turn (tool hierarchy,
                     forbidden actions, session continuity).
 
@@ -20,6 +20,7 @@ No manual configuration needed — just install, enable in config.yaml, and rest
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -27,7 +28,7 @@ import shutil
 import tempfile
 from typing import Optional
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 logger = logging.getLogger(__name__)
 
@@ -117,11 +118,12 @@ def _check_mcp_ready() -> bool:
         return False
     try:
         import subprocess
+
         handshake = (
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":'
             '{"protocolVersion":"2024-11-05","capabilities":{},'
             '"clientInfo":{"name":"hermes-probe","version":"1.0"}}}'
-            '\n'
+            "\n"
             '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n'
         )
         result = subprocess.run(
@@ -197,87 +199,161 @@ def _reset_guidance(session_id: str) -> None:
     """Clear guidance markers for a session. Called on session reset/end."""
     if session_id:
         import shutil as _shutil
+
         _shutil.rmtree(_guidance_marker_dir(session_id), ignore_errors=True)
 
 
-# ─── Routing block (injected on session start) ────────────────────────────────
+# ─── Marker-file helpers (cross-hook communication) ────────────────────────────
+
+def _marker_path(prefix: str, session_id: str, suffix: str = "") -> str:
+    # Sanitize session_id to prevent path traversal if it contains separators
+    safe_session = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
+    base = f"context-mode-{prefix}-{safe_session}"
+    if suffix:
+        # Also sanitize suffix (tool_name may contain path separators in theory)
+        safe_suffix = re.sub(r"[^a-zA-Z0-9_-]", "_", suffix)
+        base += f"-{safe_suffix}"
+    return os.path.join(tempfile.gettempdir(), f"{base}.txt")
+
+
+def _write_marker(path: str, content: str) -> None:
+    """Best-effort marker write — never block on failure."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as exc:
+        logger.debug("[context-mode] marker write failed: %s", exc)
+
+
+def _read_and_unlink_marker(path: str) -> Optional[str]:
+    """Read marker content and delete it. Returns None if absent or unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = f.read().strip()
+        os.unlink(path)
+        return data
+    except Exception:
+        return None
+
+
+# ─── Crash-resilient hook wrapper ──────────────────────────────────────────────
+
+def _hook_safe(hook_name: str):
+    """Decorator that wraps a hook so any exception is logged and swallowed.
+    Hooks must never crash the agent — a failed hook is better than a broken session.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "[context-mode] %s hook failed (swallowed): %s",
+                    hook_name,
+                    exc,
+                    exc_info=logger.isEnabledFor(logging.DEBUG),
+                )
+                return None
+
+        return wrapper
+
+    return decorator
+
+
+# ─── Routing block (injected on session start) ─────────────────────────────────
 
 ROUTING_BLOCK = """<context_window_protection>
   <priority_instructions>
-    Raw tool output floods your context window. You MUST use context-mode MCP tools to keep raw data in the sandbox.
+    Every byte a tool returns enters your conversation memory and costs reasoning capacity for the rest of the session. The context-mode tools let you do the work in a sandbox and surface only the derived answer — the raw bytes stay out. Think-in-Code: program the analysis, do not compute it by reading raw data into your conversation.
   </priority_instructions>
 
   <tool_selection_hierarchy>
     0. MEMORY: ctx_search(sort: "timeline")
-       - After resume, check prior context before asking user.
+       - On resume or compaction, query prior decisions, errors, plans, user prompts before asking the user — auto-captured session memory is searchable.
     1. GATHER: ctx_batch_execute(commands, queries)
-       - Primary tool for research. Runs all commands, auto-indexes, and searches.
-       - ONE call replaces many individual steps.
-       - Each command: {label: "descriptive section header", command: "shell command"}
-       - label becomes the FTS5 chunk title — use descriptive labels for better search.
+       - Primary research tool. Runs commands in parallel, auto-indexes each output, and (when queries are passed) returns matching sections in the same round trip — no follow-up search call.
+       - Each command: {label: "section header", command: "shell command"}; the label becomes the FTS5 chunk title — descriptive labels improve search.
        - Use concurrency: 4-8 for I/O-bound work (network calls, API queries).
        - Keep concurrency: 1 for CPU-bound (npm test, build, lint) or shared-state commands.
     2. FOLLOW-UP: ctx_search(queries: ["q1", "q2", ...])
-       - Use for all follow-up questions. ONE call, many queries.
+       - Multiple related questions about anything already indexed (your captures + session memory). Batch every question in one array; the ranking pipeline runs per-query and the round-trip cost is paid once.
     3. PROCESSING: ctx_execute(language, code) | ctx_execute_file(path, language, code)
-       - Use for API calls, log analysis, and data processing.
+       - Derive answers FROM data: filter, count, aggregate, parse, transform. Only what you console.log() enters your conversation; the raw bytes stay in the sandbox.
     4. WEB: ctx_fetch_and_index(url, source) then ctx_search(queries)
        - Raw HTML never enters context. 24h TTL cache.
   </tool_selection_hierarchy>
 
-  <forbidden_actions>
-    - DO NOT use the terminal tool for curl, wget, or any HTTP fetching — use ctx_execute or ctx_fetch_and_index.
-    - DO NOT use the terminal tool for commands producing >20 lines of output — use ctx_batch_execute or ctx_execute.
-    - DO NOT use the terminal tool for build commands (gradle, mvn, cargo build) — use ctx_execute.
-    - The terminal tool is ONLY for: git, mkdir, rm, mv, ls, npm install, pip install, and short-output commands.
-    - NEVER use ctx_execute or ctx_execute_file for file creation/modification. Use write_file or patch.
-  </forbidden_actions>
+  <when_not_to_use>
+    - You intend to PROCESS the output (filter, count, parse, aggregate) → use ctx_batch_execute or ctx_execute. Bash stays correct when you intend to OBSERVE a short fixed output (git status on a clean tree, whoami, pwd) or when you are mutating state (git, mkdir, rm, mv, navigation).
+    - You want to analyze, summarize, or extract from a file → use ctx_execute_file. Read stays correct when you intend to Edit the file (Edit needs the exact bytes in your conversation to match against).
+    - WebFetch → use ctx_fetch_and_index; full network access, results indexed for ctx_search, raw page bytes never enter your conversation.
+    - ctx_execute and ctx_execute_file for file writes → these run code in a subprocess and discard the sandbox FS; they are for analysis, processing, and computation only.
+  </when_not_to_use>
 
   <file_writing_policy>
-    ALWAYS use write_file or patch to create or modify files.
-    NEVER use ctx_execute or the terminal tool to write file content.
+    File writes use the native Write or Edit tool — ctx_execute, ctx_execute_file, and Bash subprocesses do not persist edits to the host filesystem.
+    Applies to all file types: code, configs, plans, specs, YAML, JSON, markdown.
   </file_writing_policy>
 
   <output_constraints>
-    <word_limit>Keep your final response under 500 words.</word_limit>
     <artifact_policy>
-      Write artifacts (code, configs, PRDs) to FILES using write_file or patch.
-      NEVER return them as inline text. Return only: file path + 1-line description.
+      Write artifacts (code, configs, PRDs) to files. Return only: file path + 1-line description.
     </artifact_policy>
   </output_constraints>
 
   <session_continuity>
-    Skills, roles, and decisions persist for the entire session. Do not abandon them as the conversation grows.
+    Skills, roles, and decisions set during this session remain active until the user revokes them.
+    Do not drop behavioral directives as context grows.
     After /clear or /compact: knowledge base and session stats are preserved.
   </session_continuity>
 
   <ctx_commands>
-    When the user says "ctx stats" — call the ctx_stats MCP tool and display the output.
-    When the user says "ctx doctor" — call the ctx_doctor MCP tool and display results as a checklist.
-    When the user says "ctx upgrade" — call the ctx_upgrade MCP tool and display results as a checklist.
-    When the user says "ctx purge" — call the ctx_purge MCP tool with confirm: true. Warn the user this is irreversible.
+    "ctx stats" | "ctx-stats" | "/ctx-stats" | context savings question
+    → Call ctx_stats MCP tool, display full output verbatim.
+
+    "ctx doctor" | "ctx-doctor" | "/ctx-doctor" | diagnose context-mode
+    → Call ctx_doctor MCP tool, run returned shell command, display as checklist.
+
+    "ctx upgrade" | "ctx-upgrade" | "/ctx-upgrade" | update context-mode
+    → Call ctx_upgrade MCP tool, run returned shell command, display as checklist.
+
+    "ctx purge" | "ctx-purge" | "/ctx-purge" | wipe/reset knowledge base
+    → Call ctx_purge MCP tool with confirm: true. Warn: irreversible.
+
+    After /clear or /compact: knowledge base preserved. Tell user: "context-mode knowledge base preserved. Use `ctx purge` to start fresh."
   </ctx_commands>
 </context_window_protection>"""
 
 BASH_GUIDANCE = """<context_guidance>
   <tip>
-    This terminal command may produce large output. To stay efficient:
-    - Use ctx_batch_execute(commands, queries) for multiple commands
-    - Use ctx_execute(language: "shell", code: "...") to run in sandbox
-    - Only your final printed summary will enter the context.
-    - The terminal tool is best for: git, mkdir, rm, mv, navigation, and short-output commands only.
+    When you intend to PROCESS the output (filter, count, parse, aggregate), use ctx_batch_execute(commands, queries) for multiple commands or ctx_execute(language: "shell", code: "...") for one — the raw output stays in the sandbox and only what you print enters your conversation. Bash stays the right surface when you intend to OBSERVE a short fixed output or when you are mutating state (git, mkdir, rm, mv, navigation).
   </tip>
 </context_guidance>"""
 
 READ_GUIDANCE = """<context_guidance>
   <tip>
-    Reading to Edit? read_file is correct — Edit needs content in context.
-    Reading to analyze/explore/summarize? Use ctx_execute_file(path, language, code) — only printed summary enters context.
+    Reading to Edit the file? read_file is correct — Edit needs the exact bytes in your conversation to match against.
+    Reading to analyze, summarize, or extract from the file? Use ctx_execute_file(path, language, code) — the bytes stay in the sandbox and only what your code prints enters your conversation.
+  </tip>
+</context_guidance>"""
+
+GREP_GUIDANCE = """<context_guidance>
+  <tip>
+    Grep results may be larger than you expect. When you intend to count, filter, or aggregate matches (not just spot-check one), run the search through ctx_execute(language: "shell", code: "...") — the raw match list stays in the sandbox and only your derived answer enters your conversation.
+  </tip>
+</context_guidance>"""
+
+EXTERNAL_MCP_GUIDANCE = """<context_guidance>
+  <tip>
+    External MCP tools commonly return large payloads (channel history, file content, search results) that enter your conversation in full. When you intend to filter, count, or aggregate that data, pipe it through ctx_execute(language, code) — the raw payload stays in the sandbox and only the derived answer enters your conversation. For docs-style fetches you will want to query later, prefer ctx_fetch_and_index(url, source) then ctx_search(queries).
   </tip>
 </context_guidance>"""
 
 # ─── PreToolUse hook ───────────────────────────────────────────────────────────
 
+@_hook_safe("pre_tool_call")
 def _pre_tool_call(
     *,
     tool_name: str,
@@ -294,11 +370,20 @@ def _pre_tool_call(
     if not _check_context_mode():
         return None
 
+    # MCP redirect guard: if the MCP server is not responding, do not block —
+    # the agent would get stuck with redirects to broken tools.
+    if not _check_mcp_ready():
+        logger.debug("[context-mode] MCP not ready — passthrough for %s", tool_name)
+        return None
+
+    # Write latency marker for cross-hook timing (PostToolUse reads it)
+    _write_marker(
+        _marker_path("latency", session_id, tool_name),
+        str(int(__import__("time").time() * 1000)),
+    )
+
     if tool_name == "terminal":
         return _pre_tool_call_terminal(args, session_id)
-
-    # Nudge on large read_file calls (no block — just guidance injection via pre_llm_call)
-    # We do not block read_file because the model genuinely needs it for editing.
 
     return None
 
@@ -328,9 +413,17 @@ def _pre_tool_call_terminal(args: dict, session_id: str) -> Optional[dict]:
 
             # Check for file output flags
             if is_curl:
-                has_file_out = re.search(r"\s(-o|--output)\s", s) or re.search(r"\s*>\s*", s) or re.search(r"\s*>>\s*", s)
+                has_file_out = (
+                    re.search(r"\s(-o|--output)\s", s)
+                    or re.search(r"\s*>\s*", s)
+                    or re.search(r"\s*>>\s*", s)
+                )
             else:
-                has_file_out = re.search(r"\s(-O|--output-document)\s", s) or re.search(r"\s*>\s*", s) or re.search(r"\s*>>\s*", s)
+                has_file_out = (
+                    re.search(r"\s(-O|--output-document)\s", s)
+                    or re.search(r"\s*>\s*", s)
+                    or re.search(r"\s*>>\s*", s)
+                )
 
             if not has_file_out:
                 has_dangerous = True
@@ -351,7 +444,8 @@ def _pre_tool_call_terminal(args: dict, session_id: str) -> Optional[dict]:
 
             # Must be silent to prevent progress bar stderr flood
             is_silent = (
-                re.search(r"\s-[a-zA-Z]*s|--silent", s) if is_curl
+                re.search(r"\s-[a-zA-Z]*s|--silent", s)
+                if is_curl
                 else re.search(r"\s-[a-zA-Z]*q|--quiet", s)
             )
             if not is_silent:
@@ -360,6 +454,10 @@ def _pre_tool_call_terminal(args: dict, session_id: str) -> Optional[dict]:
 
         if has_dangerous:
             logger.debug("[context-mode] blocked curl/wget stdout flood: %s", stripped[:120])
+            _write_marker(
+                _marker_path("rejected", session_id),
+                f"terminal:curl/wget stdout flood:{stripped[:200]}",
+            )
             return {
                 "action": "block",
                 "message": (
@@ -379,6 +477,10 @@ def _pre_tool_call_terminal(args: dict, session_id: str) -> Optional[dict]:
     for pattern in INLINE_HTTP_PATTERNS:
         if pattern.search(no_heredoc):
             logger.debug("[context-mode] blocked inline HTTP: %s", stripped[:120])
+            _write_marker(
+                _marker_path("rejected", session_id),
+                f"terminal:inline HTTP:{stripped[:200]}",
+            )
             return {
                 "action": "block",
                 "message": (
@@ -393,8 +495,12 @@ def _pre_tool_call_terminal(args: dict, session_id: str) -> Optional[dict]:
     # Build tools (gradle, maven, sbt, cargo) → redirect to sandbox
     for pattern in BUILD_TOOL_PATTERNS:
         if pattern.search(stripped_no_quotes):
-            safe_cmd = stripped.replace('\\', '\\\\').replace('"', '\\"')
+            safe_cmd = stripped.replace("\\", "\\\\").replace('"', '\\"')
             logger.debug("[context-mode] blocked build tool: %s", stripped[:120])
+            _write_marker(
+                _marker_path("rejected", session_id),
+                f"terminal:build tool:{stripped[:200]}",
+            )
             return {
                 "action": "block",
                 "message": (
@@ -416,6 +522,7 @@ def _pre_tool_call_terminal(args: dict, session_id: str) -> Optional[dict]:
 
 # ─── PostToolCall hook (observational) ─────────────────────────────────────────
 
+@_hook_safe("post_tool_call")
 def _post_tool_call(
     *,
     tool_name: str,
@@ -429,21 +536,46 @@ def _post_tool_call(
     """post_tool_call hook: observational logging for byte accounting and
     redirect tracking. Does not modify results.
     """
-    # Future: write redirect events to a local SQLite for session continuity
-    # (mirrors Claude Code's SessionDB integration).
     if not session_id:
         return
-    # Log large tool outputs for debugging context usage
+
     result_len = len(result) if isinstance(result, str) else 0
+
+    # ── Large output warning ──
     if result_len > 50_000:
         logger.debug(
             "[context-mode] large tool output: %s returned %d bytes in %d ms (session=%s)",
-            tool_name, result_len, duration_ms, session_id[:8],
+            tool_name,
+            result_len,
+            duration_ms,
+            session_id[:8],
         )
+
+    # ── Rejected-approach marker (from PreToolUse) ──
+    rejected_data = _read_and_unlink_marker(_marker_path("rejected", session_id))
+    if rejected_data:
+        logger.info("[context-mode] rejected-approach: %s", rejected_data)
+
+    # ── Latency marker (from PreToolUse) ──
+    latency_data = _read_and_unlink_marker(_marker_path("latency", session_id, tool_name))
+    if latency_data:
+        try:
+            start_time = int(latency_data)
+            elapsed = int((__import__("time").time() * 1000)) - start_time
+            if elapsed > 5000:
+                logger.info(
+                    "[context-mode] tool_latency: %s took %d ms (session=%s)",
+                    tool_name,
+                    elapsed,
+                    session_id[:8],
+                )
+        except ValueError:
+            pass
 
 
 # ─── PreLLMCall hook ───────────────────────────────────────────────────────────
 
+@_hook_safe("pre_llm_call")
 def _pre_llm_call(
     *,
     session_id: str,
@@ -470,6 +602,7 @@ def _pre_llm_call(
 
 # ─── Session lifecycle hooks ───────────────────────────────────────────────────
 
+@_hook_safe("on_session_end")
 def _on_session_end(*, session_id: str = "", **_kwargs) -> None:
     """Clean up per-session guidance markers on session end."""
     if session_id:
@@ -477,6 +610,7 @@ def _on_session_end(*, session_id: str = "", **_kwargs) -> None:
         logger.debug("[context-mode] cleared guidance markers for session %s", session_id)
 
 
+@_hook_safe("on_session_reset")
 def _on_session_reset(*, session_id: str = "", **_kwargs) -> None:
     """Clean up per-session guidance markers on session reset."""
     if session_id:
