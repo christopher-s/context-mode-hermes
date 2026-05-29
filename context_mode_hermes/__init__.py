@@ -28,7 +28,7 @@ import shutil
 import tempfile
 from typing import Optional
 
-__version__ = "1.2.0"
+__version__ = "1.2.2"
 
 logger = logging.getLogger(__name__)
 
