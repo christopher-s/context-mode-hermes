@@ -98,13 +98,36 @@ BUILD_TOOL_PATTERNS = [
 
 # ─── Availability checks ───────────────────────────────────────────────────────
 
+def _resolve_context_mode_binary() -> str:
+    """Return the path to the context-mode binary, checking PATH then known location."""
+    binary = shutil.which("context-mode")
+    if binary:
+        return binary
+    known = os.path.expanduser("~/.hermes/node/bin/context-mode")
+    if os.path.exists(known):
+        return known
+    return "context-mode"  # fallback — will fail loudly if truly missing
+
+
 def _check_context_mode() -> bool:
-    """Check if context-mode binary is available in PATH. Result is cached."""
+    """Check if context-mode binary is available in PATH or known location. Result is cached."""
     global _ctx_available
     if _ctx_available is not None:
         return _ctx_available
-    _ctx_available = shutil.which("context-mode") is not None
-    return _ctx_available
+    
+    # Check PATH first
+    if shutil.which("context-mode") is not None:
+        _ctx_available = True
+        return True
+    
+    # Fallback to known install location
+    known_path = os.path.expanduser("~/.hermes/node/bin/context-mode")
+    if os.path.exists(known_path):
+        _ctx_available = True
+        return True
+    
+    _ctx_available = False
+    return False
 
 
 def _check_mcp_ready() -> bool:
@@ -114,8 +137,10 @@ def _check_mcp_ready() -> bool:
         return _mcp_ready
     binary = shutil.which("context-mode")
     if not binary:
-        _mcp_ready = False
-        return False
+        binary = _resolve_context_mode_binary()
+        if binary == "context-mode":
+            _mcp_ready = False
+            return False
     try:
         import subprocess
 
@@ -592,7 +617,7 @@ def _post_tool_call(
         env["CLAUDE_PROJECT_DIR"] = os.getcwd()
         
         subprocess.run(
-            ["context-mode", "hook", "claude-code", "posttooluse"],
+            [_resolve_context_mode_binary(), "hook", "claude-code", "posttooluse"],
             input=payload,
             text=True,
             env=env,
@@ -689,7 +714,7 @@ def _trigger_session_start(session_id: str, is_resume: bool) -> str:
         payload = json.dumps({"source": source})
         
         result = subprocess.run(
-            ["context-mode", "hook", "claude-code", "sessionstart"],
+            [_resolve_context_mode_binary(), "hook", "claude-code", "sessionstart"],
             input=payload,
             text=True,
             env=env,
