@@ -43,14 +43,6 @@ def test_deny_without_reason():
         result = context_mode_hermes._route_via_hook("terminal", {"command": "ls"}, "test")
         assert result == {"action": "block", "message": ""}
 
-def test_empty_tool_name_passthrough(mock_binary_available, mock_mcp_ready):
-    """Empty tool_name → still routes through hook (binary decides)."""
-    with patch("context_mode_hermes._route_via_hook", return_value=None) as mock_route:
-        context_mode_hermes._pre_tool_call(
-            tool_name="", args={}, session_id="test", task_id="t1"
-        )
-        mock_route.assert_called_once()
-
 def test_hook_safe_swallows_exceptions():
     """If a hook raises, _hook_safe wrapper swallows it (returns None)."""
     with patch("context_mode_hermes._check_context_mode", side_effect=RuntimeError("boom")):

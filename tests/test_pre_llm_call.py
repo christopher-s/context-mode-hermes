@@ -13,7 +13,6 @@ def test_binary_unavailable_returns_none(mock_binary_unavailable):
         assert result is None
 
 def test_first_turn_injects_routing_block(mock_binary_available, mock_mcp_ready):
-    """First turn → routing block injected via {"context": ...}."""
     with patch("context_mode_hermes._check_context_mode", return_value=True), \
          patch("context_mode_hermes._trigger_session_start", return_value=""), \
          patch("context_mode_hermes._write_marker"):
@@ -23,8 +22,7 @@ def test_first_turn_injects_routing_block(mock_binary_available, mock_mcp_ready)
         )
         assert result is not None
         assert "context" in result
-        # When upstream returns empty, falls back to ROUTING_BLOCK
-        assert "context_window_protection" in result["context"] or "context" in result["context"].lower()
+        assert "ctx_execute" in result["context"]
 
 def test_first_turn_with_existing_marker_skips_injection(mock_binary_available, mock_mcp_ready):
     """If injected marker already exists → skip (no duplicate)."""
