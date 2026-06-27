@@ -5,6 +5,12 @@ import tempfile
 import os
 import shutil
 
+# Make the real context-mode binary discoverable for integration tests.
+# Hermes installs it to ~/.hermes/node/bin/ which isn't on the default PATH.
+_HERMES_NODE_BIN = os.path.expanduser("~/.hermes/node/bin")
+if os.path.isdir(_HERMES_NODE_BIN) and shutil.which("context-mode") is None:
+    os.environ["PATH"] = _HERMES_NODE_BIN + os.pathsep + os.environ.get("PATH", "")
+
 @pytest.fixture(autouse=True)
 def reset_module_state():
     """Resets module-global caches before each test."""
