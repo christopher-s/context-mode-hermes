@@ -1,0 +1,7 @@
+ M .gitignore
+ M pyproject.toml
+?? .github/
+?? .sisyphus/
+?? tests/
+!! .reference/
+!! .venv/

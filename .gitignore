@@ -22,3 +22,11 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test / cache artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Reference-only upstream checkouts
+.reference/

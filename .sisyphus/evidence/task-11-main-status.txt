@@ -1,0 +1,13 @@
+ M .gitignore
+ M README.md
+ M context_mode_hermes/__init__.py
+ M pyproject.toml
+?? .github/
+?? .sisyphus/
+?? tests/
+!! .pytest_cache/
+!! .reference/
+!! .venv/
+!! context_mode_hermes.egg-info/
+!! context_mode_hermes/__pycache__/
+!! tests/__pycache__/

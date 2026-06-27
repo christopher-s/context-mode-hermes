@@ -35,67 +35,6 @@ logger = logging.getLogger(__name__)
 _ctx_available: Optional[bool] = None
 _mcp_ready: Optional[bool] = None
 
-# ─── Command patterns ──────────────────────────────────────────────────────────
-
-# Shell control operators that can compose a safe command with an unbounded sink.
-# Any match disqualifies the command from the allowlist.
-SHELL_CONTROL_OPERATORS = re.compile(r"[|`\n\r]|\$\(|>>|>|<(?!<)|&(?!&)|&&|\|\||;")
-
-# Commands whose output is structurally bounded (short / silent on success).
-# These skip the routing nudge — the warning would be noise.
-# Each pattern MUST be anchored and must NOT contain shell control operators.
-SAFE_COMMAND_PATTERNS = [
-    re.compile(r"^pwd$"),
-    re.compile(r"^whoami$"),
-    re.compile(r"^hostname(?:\s+-[a-zA-Z]+)?$"),
-    re.compile(r"^uname(?:\s+-[a-zA-Z]+)?$"),
-    re.compile(r"^id(?:\s+\S+)?$"),
-    re.compile(r"^date(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^echo\s"),
-    re.compile(r"^printf\s"),
-    re.compile(r"^which\s+\S+(?:\s+\S+)*$"),
-    re.compile(r"^type\s+\S+(?:\s+\S+)*$"),
-    re.compile(r"^command\s+-v\s+\S+(?:\s+\S+)*$"),
-    re.compile(r"^readlink(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^basename(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^dirname(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^realpath(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^cd(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^mkdir(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^touch\s+[^\r\n]+$"),
-    re.compile(r"^mv(?!\s+-[a-zA-Z]*v[a-zA-Z]*)(?!\s+--verbose\b)\s+[^\r\n]+$"),
-    re.compile(r"^cp(?!\s+-[a-zA-Z]*v[a-zA-Z]*)(?!\s+--verbose\b)\s+[^\r\n]+$"),
-    re.compile(r"^rm(?!\s+-[a-zA-Z]*v[a-zA-Z]*)(?!\s+--verbose\b)\s+[^\r\n]+$"),
-    re.compile(r"^ln(?!\s+-[a-zA-Z]*v[a-zA-Z]*)(?!\s+--verbose\b)\s+[^\r\n]+$"),
-    re.compile(r"^ls(?!\s+-[a-zA-Z]*R)(?!\s+--recursive)(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^git\s+status(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^git\s+rev-parse(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^git\s+remote(?:\s+-v|\s+show\s+\S+)?$"),
-    re.compile(r"^git\s+branch(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^git\s+config\s+--get(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^git\s+diff\s+--stat(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^git\s+diff\s+--name-only(?:\s+[^\r\n]+)?$"),
-    re.compile(r"^git\s+stash\s+list$"),
-    re.compile(r"^git\s+tag(?:\s+-l(?:\s+[^\r\n]+)?)?$"),
-    re.compile(r"^git\s+log\s+-\d{1,2}(?:\s+[^\r\n]+)?$"),
-    re.compile(r"(?:^|\s)--version(?:\s|$)"),
-    re.compile(r"^\S+\s+-V(?:\s|$)"),
-]
-
-# Inline HTTP patterns inside shell commands (heredocs stripped first)
-INLINE_HTTP_PATTERNS = [
-    re.compile(r"\bfetch\s*\(\s*['\"](https?://|http)"),
-    re.compile(r"\brequests\.(get|post|put|delete|patch)\s*\("),
-    re.compile(r"\bhttp\.(get|post|request)\s*\("),
-    re.compile(r"\burllib\.request\.urlopen\s*\("),
-]
-
-# Build tools that produce extremely verbose output
-BUILD_TOOL_PATTERNS = [
-    re.compile(r"(?:^|\s|&&|\||\;)(\.\/gradlew|gradlew|gradle|\.\/mvnw|mvnw|mvn|\.\/sbt|sbt)(\s|$)"),
-    re.compile(r"\bcargo\s+(build|test|run|check)\b"),
-]
-
 # ─── Availability checks ───────────────────────────────────────────────────────
 
 def _resolve_context_mode_binary() -> str:
@@ -163,37 +102,6 @@ def _check_mcp_ready() -> bool:
         logger.debug("[context-mode] MCP readiness probe failed: %s", exc)
         _mcp_ready = False
     return _mcp_ready
-
-
-# ─── Quote stripping (prevents false positives) ────────────────────────────────
-
-def _strip_heredocs(cmd: str) -> str:
-    """Strip heredoc content so regex only matches command tokens."""
-    return re.sub(r"<<-?\s*[\"']?(\w+)[\"']?[\s\S]*?\n\s*\1", "", cmd)
-
-
-def _strip_quoted_content(cmd: str) -> str:
-    """Strip ALL quoted content: heredocs, single-quoted strings, double-quoted strings.
-    Prevents false positives like: gh issue edit --body "text with curl in it"
-    """
-    no_heredoc = _strip_heredocs(cmd)
-    no_single = re.sub(r"'[^']*'", "''", no_heredoc)
-    no_double = re.sub(r'"[^"]*"', '""', no_single)
-    return no_double
-
-
-# ─── Structural boundedness check ──────────────────────────────────────────────
-
-def _is_structurally_bounded(command: str) -> bool:
-    """Return True when the command's output is bounded enough that the routing
-    nudge would be noise. Conservative — unknown commands return False.
-    """
-    if not command:
-        return False
-    trimmed = command.strip()
-    if SHELL_CONTROL_OPERATORS.search(trimmed):
-        return False
-    return any(rx.search(trimmed) for rx in SAFE_COMMAND_PATTERNS)
 
 
 # ─── Guidance throttle (per-session, file-backed) ──────────────────────────────
@@ -351,31 +259,6 @@ ROUTING_BLOCK = """<context_window_protection>
   </ctx_commands>
 </context_window_protection>"""
 
-BASH_GUIDANCE = """<context_guidance>
-  <tip>
-    When you intend to PROCESS the output (filter, count, parse, aggregate), use ctx_batch_execute(commands, queries) for multiple commands or ctx_execute(language: "shell", code: "...") for one — the raw output stays in the sandbox and only what you print enters your conversation. Bash stays the right surface when you intend to OBSERVE a short fixed output or when you are mutating state (git, mkdir, rm, mv, navigation).
-  </tip>
-</context_guidance>"""
-
-READ_GUIDANCE = """<context_guidance>
-  <tip>
-    Reading to Edit the file? read_file is correct — Edit needs the exact bytes in your conversation to match against.
-    Reading to analyze, summarize, or extract from the file? Use ctx_execute_file(path, language, code) — the bytes stay in the sandbox and only what your code prints enters your conversation.
-  </tip>
-</context_guidance>"""
-
-GREP_GUIDANCE = """<context_guidance>
-  <tip>
-    Grep results may be larger than you expect. When you intend to count, filter, or aggregate matches (not just spot-check one), run the search through ctx_execute(language: "shell", code: "...") — the raw match list stays in the sandbox and only your derived answer enters your conversation.
-  </tip>
-</context_guidance>"""
-
-EXTERNAL_MCP_GUIDANCE = """<context_guidance>
-  <tip>
-    External MCP tools commonly return large payloads (channel history, file content, search results) that enter your conversation in full. When you intend to filter, count, or aggregate that data, pipe it through ctx_execute(language, code) — the raw payload stays in the sandbox and only the derived answer enters your conversation. For docs-style fetches you will want to query later, prefer ctx_fetch_and_index(url, source) then ctx_search(queries).
-  </tip>
-</context_guidance>"""
-
 # ─── PreToolUse hook ───────────────────────────────────────────────────────────
 
 @_hook_safe("pre_tool_call")
@@ -387,10 +270,10 @@ def _pre_tool_call(
     session_id: str = "",
     **_kwargs,
 ) -> Optional[dict]:
-    """pre_tool_call hook: intercept terminal calls that would flood context.
+    """pre_tool_call hook: delegate routing to context-mode binary.
 
-    Returns {"action": "block", "message": str} to veto the call and redirect
-    the model to use context-mode MCP tools instead.
+    Returns {"action": "block", "message": str} to veto and redirect,
+    or None to passthrough.
     """
     if not _check_context_mode():
         return None
@@ -407,142 +290,87 @@ def _pre_tool_call(
         str(int(__import__("time").time() * 1000)),
     )
 
-    if tool_name == "terminal":
-        return _pre_tool_call_terminal(args, session_id)
+    # Delegate ALL routing decisions to the context-mode binary
+    result = _route_via_hook(tool_name, args, session_id)
 
-    return None
+    # Write rejected marker for post_tool_call logging if blocked
+    if result and result.get("action") == "block":
+        _write_marker(
+            _marker_path("rejected", session_id),
+            f"{tool_name}:{str(args)[:200]}",
+        )
+
+    return result
 
 
-def _pre_tool_call_terminal(args: dict, session_id: str) -> Optional[dict]:
-    command = args.get("command")
-    if not isinstance(command, str) or not command:
+def _route_via_hook(tool_name: str, args: dict, session_id: str) -> Optional[dict]:
+    """Delegate pre-tool routing to the context-mode binary's pretooluse hook.
+
+    The binary contains the canonical routing logic (safe command allowlist,
+    curl/wget detection, inline HTTP, build tools, WebFetch interception).
+    We call it via subprocess and map its response to Hermes format.
+
+    Input to binary (stdin JSON):
+        {"tool_name": "Bash", "tool_input": {"command": "..."}, ...}
+
+    Output from binary (stdout JSON):
+        {"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "..."}}
+        or empty/null for passthrough.
+    """
+    import subprocess
+
+    try:
+        import json
+
+        tool_map = {"terminal": "Bash", "webfetch": "WebFetch", "WebFetch": "WebFetch"}
+        cc_tool_name = tool_map.get(tool_name, tool_name)
+
+        payload = json.dumps({
+            "tool_name": cc_tool_name,
+            "tool_input": args if isinstance(args, dict) else {},
+            "session_id": session_id,
+            "cwd": os.getcwd(),
+        })
+
+        env = dict(os.environ)
+        env["CLAUDE_SESSION_ID"] = session_id
+        env["CLAUDE_PROJECT_DIR"] = os.getcwd()
+
+        result = subprocess.run(
+            [_resolve_context_mode_binary(), "hook", "claude-code", "pretooluse"],
+            input=payload,
+            text=True,
+            env=env,
+            timeout=5,
+            capture_output=True,
+        )
+
+        if result.returncode != 0:
+            logger.debug("[context-mode] pretooluse hook exited %d", result.returncode)
+            return None
+
+        stdout = result.stdout.strip()
+        if not stdout:
+            return None
+
+        data = json.loads(stdout)
+
+        hook_output = data.get("hookSpecificOutput", {})
+        decision = hook_output.get("permissionDecision", "")
+        reason = hook_output.get("permissionDecisionReason", "")
+
+        if decision == "deny":
+            return {"action": "block", "message": reason}
+        elif decision == "ask":
+            return {"action": "ask", "message": reason}
         return None
 
-    stripped = command.strip()
-    stripped_no_quotes = _strip_quoted_content(stripped)
-
-    # Pass through structurally bounded commands (RTK territory)
-    if _is_structurally_bounded(stripped):
+    except subprocess.TimeoutExpired:
+        logger.debug("[context-mode] pretooluse hook timed out — passthrough")
         return None
-
-    # curl/wget — allow silent file-output downloads, block stdout floods (#166).
-    if re.search(r"(?:^|\s|&&|\||\;)(curl|wget)\s", stripped_no_quotes, re.I):
-        segments = re.split(r"\s*(?:&&|\|\||;)\s*", stripped_no_quotes)
-        has_dangerous = False
-        for seg in segments:
-            s = seg.strip()
-            if not re.search(r"(?:^|\s)(curl|wget)\s", s, re.I):
-                continue
-            is_curl = re.search(r"\bcurl\b", s, re.I)
-            is_wget = re.search(r"\bwget\b", s, re.I)
-
-            # Check for file output flags
-            if is_curl:
-                has_file_out = (
-                    re.search(r"\s(-o|--output)\s", s)
-                    or re.search(r"\s*>\s*", s)
-                    or re.search(r"\s*>>\s*", s)
-                )
-            else:
-                has_file_out = (
-                    re.search(r"\s(-O|--output-document)\s", s)
-                    or re.search(r"\s*>\s*", s)
-                    or re.search(r"\s*>>\s*", s)
-                )
-
-            if not has_file_out:
-                has_dangerous = True
-                break
-
-            # Stdout aliases: -o -, -o /dev/stdout, -O -
-            if is_curl and re.search(r"\s(-o|--output)\s+(-|\/dev\/stdout)(\s|$)", s):
-                has_dangerous = True
-                break
-            if is_wget and re.search(r"\s(-O|--output-document)\s+(-|\/dev\/stdout)(\s|$)", s):
-                has_dangerous = True
-                break
-
-            # Verbose/trace flags flood stderr → context
-            if re.search(r"\s(-v|--verbose|--trace|-D\s+-)\b", s):
-                has_dangerous = True
-                break
-
-            # Must be silent to prevent progress bar stderr flood
-            is_silent = (
-                re.search(r"\s-[a-zA-Z]*s|--silent", s)
-                if is_curl
-                else re.search(r"\s-[a-zA-Z]*q|--quiet", s)
-            )
-            if not is_silent:
-                has_dangerous = True
-                break
-
-        if has_dangerous:
-            logger.debug("[context-mode] blocked curl/wget stdout flood: %s", stripped[:120])
-            _write_marker(
-                _marker_path("rejected", session_id),
-                f"terminal:curl/wget stdout flood:{stripped[:200]}",
-            )
-            return {
-                "action": "block",
-                "message": (
-                    "context-mode: curl/wget blocked. Think in Code — use "
-                    "ctx_execute(language, code) to write code that fetches, "
-                    "processes, and prints only the answer. Or use "
-                    "ctx_fetch_and_index(url, source) to fetch and index. "
-                    "Write pure JS with try/catch, no npm deps. "
-                    "Do NOT retry with curl/wget."
-                ),
-            }
-        # All segments safe → allow through (silent file download)
+    except Exception as exc:
+        logger.debug("[context-mode] pretooluse hook failed: %s", exc)
         return None
-
-    # Inline HTTP detection (strip heredocs only — quoted content in -e flags is fine)
-    no_heredoc = _strip_heredocs(stripped)
-    for pattern in INLINE_HTTP_PATTERNS:
-        if pattern.search(no_heredoc):
-            logger.debug("[context-mode] blocked inline HTTP: %s", stripped[:120])
-            _write_marker(
-                _marker_path("rejected", session_id),
-                f"terminal:inline HTTP:{stripped[:200]}",
-            )
-            return {
-                "action": "block",
-                "message": (
-                    "context-mode: Inline HTTP blocked. Think in Code — use "
-                    "ctx_execute(language, code) to write code that fetches, "
-                    "processes, and console.log() only the result. "
-                    "Write robust pure JS with try/catch, no npm deps. "
-                    "Do NOT retry with the terminal tool."
-                ),
-            }
-
-    # Build tools (gradle, maven, sbt, cargo) → redirect to sandbox
-    for pattern in BUILD_TOOL_PATTERNS:
-        if pattern.search(stripped_no_quotes):
-            safe_cmd = stripped.replace("\\", "\\\\").replace('"', '\\"')
-            logger.debug("[context-mode] blocked build tool: %s", stripped[:120])
-            _write_marker(
-                _marker_path("rejected", session_id),
-                f"terminal:build tool:{stripped[:200]}",
-            )
-            return {
-                "action": "block",
-                "message": (
-                    f'context-mode: Build tool redirected. Think in Code — use '
-                    f'ctx_execute(language: "shell", code: "{safe_cmd} 2>&1 | tail -30") '
-                    f"to run and print only errors/summary. "
-                    f"Do NOT retry with the terminal tool."
-                ),
-            }
-
-    # Advisory for other potentially high-output commands (once per session)
-    if _guidance_once("bash", session_id):
-        # We cannot inject context from pre_tool_call in Hermes (only block).
-        # Guidance is injected via pre_llm_call on first turn.
-        logger.debug("[context-mode] bash guidance marker set for session %s", session_id)
-
-    return None
 
 
 # ─── PostToolCall hook (observational) ─────────────────────────────────────────
@@ -671,6 +499,7 @@ def _pre_llm_call(
     # Intervene on commands attempting to format the model's knowledge base
     msg = user_message.lower().strip()
     if msg in ("/clear", "/compact", "clear", "compact"):
+        _trigger_precompact(session_id)
         return {
             "context": (
                 "After /clear or /compact: knowledge base preserved. Tell the user: "
@@ -729,6 +558,26 @@ def _trigger_session_start(session_id: str, is_resume: bool) -> str:
         logger.debug("[context-mode] failed to trigger SessionStart: %s", exc)
     
     return ""
+
+
+def _trigger_precompact(session_id: str) -> None:
+    """Forward precompact event so upstream can build a resume snapshot before compaction."""
+    try:
+        import subprocess
+
+        env = dict(os.environ)
+        env["CLAUDE_SESSION_ID"] = session_id
+        env["CLAUDE_PROJECT_DIR"] = os.getcwd()
+
+        subprocess.run(
+            [_resolve_context_mode_binary(), "hook", "claude-code", "precompact"],
+            text=True,
+            env=env,
+            timeout=2,
+            capture_output=True,
+        )
+    except Exception as exc:
+        logger.debug("[context-mode] failed to forward precompact: %s", exc)
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
