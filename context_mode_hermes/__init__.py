@@ -291,6 +291,12 @@ def _pre_tool_call(
     return result
 
 
+_CC_MCP_PREFIX = re.compile(r"mcp__plugin_context-mode_context-mode__(\w+)")
+
+def _remap_tool_names(text: str) -> str:
+    return _CC_MCP_PREFIX.sub(r"\1", text)
+
+
 def _route_via_hook(tool_name: str, args: dict, session_id: str) -> Optional[dict]:
     """Delegate pre-tool routing to the context-mode binary's pretooluse hook.
 
@@ -344,9 +350,9 @@ def _route_via_hook(tool_name: str, args: dict, session_id: str) -> Optional[dic
         reason = hook_output.get("permissionDecisionReason", "")
 
         if decision == "deny":
-            return {"action": "block", "message": reason}
+            return {"action": "block", "message": _remap_tool_names(reason)}
         elif decision == "ask":
-            return {"action": "ask", "message": reason}
+            return {"action": "ask", "message": _remap_tool_names(reason)}
         return None
 
     except subprocess.TimeoutExpired:

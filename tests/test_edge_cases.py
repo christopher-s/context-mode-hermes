@@ -3,6 +3,32 @@ import json
 from unittest.mock import patch, MagicMock
 import context_mode_hermes
 
+def test_remap_strips_cc_mcp_prefix():
+    assert context_mode_hermes._remap_tool_names(
+        "Call mcp__plugin_context-mode_context-mode__ctx_execute(language, code)"
+    ) == "Call ctx_execute(language, code)"
+
+def test_remap_handles_multiple_tools():
+    text = "Call mcp__plugin_context-mode_context-mode__ctx_fetch_and_index then mcp__plugin_context-mode_context-mode__ctx_search"
+    result = context_mode_hermes._remap_tool_names(text)
+    assert "ctx_fetch_and_index" in result
+    assert "ctx_search" in result
+    assert "mcp__plugin" not in result
+
+def test_remap_leaves_non_mcp_text_untouched():
+    text = "Use Bash or terminal to run commands"
+    assert context_mode_hermes._remap_tool_names(text) == text
+
+def test_route_via_hook_remaps_deny_reason():
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = '{"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "Call mcp__plugin_context-mode_context-mode__ctx_execute"}}'
+    with patch("context_mode_hermes._resolve_context_mode_binary", return_value="/fake/cm"), \
+         patch("subprocess.run", return_value=mock_result):
+        result = context_mode_hermes._route_via_hook("terminal", {"command": "curl"}, "test")
+        assert result == {"action": "block", "message": "Call ctx_execute"}
+        assert "mcp__plugin" not in result["message"]
+
 def test_malformed_json_from_binary():
     """Binary returns invalid JSON → fail-open (None)."""
     mock_result = MagicMock()
