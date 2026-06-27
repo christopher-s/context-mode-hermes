@@ -53,19 +53,19 @@ def test_hook_safe_swallows_exceptions():
         assert result is None
 
 def test_session_lifecycle_clears_markers(mock_binary_available):
-    """on_session_end clears guidance markers."""
-    with patch("context_mode_hermes._reset_guidance") as mock_reset:
+    """on_session_end cleans up session marker files."""
+    with patch("context_mode_hermes._cleanup_session_markers") as mock_cleanup:
         context_mode_hermes._on_session_end(session_id="test-sess")
-        mock_reset.assert_called_once_with("test-sess")
+        mock_cleanup.assert_called_once_with("test-sess")
 
 def test_session_reset_clears_markers(mock_binary_available):
-    """on_session_reset clears guidance markers."""
-    with patch("context_mode_hermes._reset_guidance") as mock_reset:
+    """on_session_reset cleans up session marker files."""
+    with patch("context_mode_hermes._cleanup_session_markers") as mock_cleanup:
         context_mode_hermes._on_session_reset(session_id="test-sess")
-        mock_reset.assert_called_once_with("test-sess")
+        mock_cleanup.assert_called_once_with("test-sess")
 
 def test_session_end_no_session_id():
     """on_session_end with empty session_id → no-op."""
-    with patch("context_mode_hermes._reset_guidance") as mock_reset:
+    with patch("context_mode_hermes._cleanup_session_markers") as mock_cleanup:
         context_mode_hermes._on_session_end(session_id="")
-        mock_reset.assert_not_called()
+        mock_cleanup.assert_not_called()

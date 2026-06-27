@@ -51,9 +51,9 @@ def mock_mcp_not_ready():
         yield
 
 @pytest.fixture
-def tmp_guidance_dir(tmp_path):
-    """Patches _guidance_marker_dir to use a tmp_path."""
+def tmp_markers(tmp_path):
+    """Patches marker paths to use a tmp_path instead of the system temp dir."""
     marker_dir = tmp_path / "markers"
     marker_dir.mkdir()
-    with patch("context_mode_hermes._guidance_marker_dir", return_value=str(marker_dir)):
+    with patch("context_mode_hermes._marker_path", side_effect=lambda prefix, sid, suffix="": os.path.join(str(marker_dir), f"{prefix}-{sid}-{suffix}.txt" if suffix else f"{prefix}-{sid}.txt")):
         yield marker_dir

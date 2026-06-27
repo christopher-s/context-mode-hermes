@@ -1,34 +1,34 @@
 """
 Context Mode Plugin for Hermes Agent
 
-Intercepts high-output tool calls and redirects to Context Mode MCP tools
-for sandboxed execution, achieving up to 98% context window savings.
+Thin adapter that delegates tool-call routing to the Context Mode binary.
+Intercepts terminal and webfetch tool calls, forwards them to the context-mode
+binary's pretooluse hook, and maps the binary's decision to Hermes format.
 
 Hooks:
-  pre_tool_call   — Blocks curl/wget (with nuance), inline HTTP, build tools;
-                    guides on high-output Bash; nudges large reads.
-  post_tool_call  — Observational: reads redirect/latency markers, logs events.
-  pre_llm_call    — Injects routing rules on first turn (tool hierarchy,
-                    forbidden actions, session continuity).
-
-Installation:
-    uv pip install -e ~/tools/context-mode-hermes --python ~/.hermes/hermes-agent/venv/bin/python
+  pre_tool_call   — Forwards tool calls to binary for routing decisions.
+  post_tool_call  — Observational: reads markers, forwards events to SessionDB.
+  pre_llm_call    — Injects routing rules on first turn; handles /compact snapshot.
+  on_session_end  — Cleans up session marker files.
+  on_session_reset — Cleans up session marker files.
 
 The plugin auto-registers via the hermes_agent.plugins entry point.
-No manual configuration needed — just install, enable in config.yaml, and restart Hermes.
 """
 
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
+import time
 from typing import Optional
 
-__version__ = "1.2.2"
+__version__ = "1.3.0"
 
 logger = logging.getLogger(__name__)
 
@@ -74,15 +74,13 @@ def _check_mcp_ready() -> bool:
     global _mcp_ready
     if _mcp_ready is not None:
         return _mcp_ready
-    binary = shutil.which("context-mode")
-    if not binary:
-        binary = _resolve_context_mode_binary()
-        if binary == "context-mode":
-            _mcp_ready = False
-            return False
+    binary = _resolve_context_mode_binary()
+    # _resolve_context_mode_binary returns "context-mode" as bare fallback
+    # which will fail in subprocess — check if it's a real path
+    if binary == "context-mode" and shutil.which("context-mode") is None:
+        _mcp_ready = False
+        return False
     try:
-        import subprocess
-
         handshake = (
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":'
             '{"protocolVersion":"2024-11-05","capabilities":{},'
@@ -104,36 +102,26 @@ def _check_mcp_ready() -> bool:
     return _mcp_ready
 
 
-# ─── Guidance throttle (per-session, file-backed) ──────────────────────────────
+# ─── Session marker cleanup ────────────────────────────────────────────────────
 
-def _guidance_marker_dir(session_id: str) -> str:
-    return os.path.join(tempfile.gettempdir(), f"cm-hermes-guidance-{session_id}")
-
-
-def _guidance_once(type_name: str, session_id: str) -> bool:
-    """Return True if this is the first time this guidance type has been shown
-    for this session. Uses atomic file creation (O_CREAT | O_EXCL) for
-    cross-process safety.
-    """
+def _cleanup_session_markers(session_id: str) -> None:
+    """Remove session marker files from temp dir."""
     if not session_id:
-        return True
-    dir_path = _guidance_marker_dir(session_id)
-    os.makedirs(dir_path, exist_ok=True)
-    marker = os.path.join(dir_path, type_name)
-    try:
-        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-        return True
-    except FileExistsError:
-        return False
-
-
-def _reset_guidance(session_id: str) -> None:
-    """Clear guidance markers for a session. Called on session reset/end."""
-    if session_id:
-        import shutil as _shutil
-
-        _shutil.rmtree(_guidance_marker_dir(session_id), ignore_errors=True)
+        return
+    for prefix in ("injected", "rejected", "latency"):
+        marker = _marker_path(prefix, session_id)
+        try:
+            os.unlink(marker)
+        except (FileNotFoundError, OSError):
+            pass
+    # Latency markers include tool_name suffix — glob cleanup
+    import glob
+    safe_session = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
+    for stale in glob.glob(os.path.join(tempfile.gettempdir(), f"context-mode-latency-{safe_session}-*.txt")):
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass
 
 
 # ─── Marker-file helpers (cross-hook communication) ────────────────────────────
@@ -287,7 +275,7 @@ def _pre_tool_call(
     # Write latency marker for cross-hook timing (PostToolUse reads it)
     _write_marker(
         _marker_path("latency", session_id, tool_name),
-        str(int(__import__("time").time() * 1000)),
+        str(int(time.time() * 1000)),
     )
 
     # Delegate ALL routing decisions to the context-mode binary
@@ -317,11 +305,7 @@ def _route_via_hook(tool_name: str, args: dict, session_id: str) -> Optional[dic
         {"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "..."}}
         or empty/null for passthrough.
     """
-    import subprocess
-
     try:
-        import json
-
         tool_map = {"terminal": "Bash", "webfetch": "WebFetch", "WebFetch": "WebFetch"}
         cc_tool_name = tool_map.get(tool_name, tool_name)
 
@@ -415,7 +399,7 @@ def _post_tool_call(
     if latency_data:
         try:
             start_time = int(latency_data)
-            elapsed = int((__import__("time").time() * 1000)) - start_time
+            elapsed = int((time.time() * 1000)) - start_time
             if elapsed > 5000:
                 logger.info(
                     "[context-mode] tool_latency: %s took %d ms (session=%s)",
@@ -431,9 +415,6 @@ def _post_tool_call(
     # masquerading as 'claude-code', we inherit the full SQLite SessionDB 
     # tracking without reinventing it in Python.
     try:
-        import subprocess
-        import json
-        
         payload = json.dumps({
             "tool_name": tool_name,
             "tool_input": args,
@@ -514,30 +495,23 @@ def _pre_llm_call(
 
 @_hook_safe("on_session_end")
 def _on_session_end(*, session_id: str = "", **_kwargs) -> None:
-    """Clean up per-session guidance markers on session end."""
     if session_id:
-        _reset_guidance(session_id)
-        logger.debug("[context-mode] cleared guidance markers for session %s", session_id)
+        _cleanup_session_markers(session_id)
 
 
 @_hook_safe("on_session_reset")
 def _on_session_reset(*, session_id: str = "", **_kwargs) -> None:
-    """Clean up per-session guidance markers on session reset."""
     if session_id:
-        _reset_guidance(session_id)
-        logger.debug("[context-mode] cleared guidance markers on reset for session %s", session_id)
+        _cleanup_session_markers(session_id)
 
 
 def _trigger_session_start(session_id: str, is_resume: bool) -> str:
     """Trigger upstream SessionStart to generate auto-injection logic."""
     try:
-        import subprocess
-        import json
-        
         env = dict(os.environ)
         env["CLAUDE_SESSION_ID"] = session_id
         env["CLAUDE_PROJECT_DIR"] = os.getcwd()
-        
+
         # 'startup' for fresh sessions, 'resume' for continued sessions
         source = "resume" if is_resume else "startup"
         payload = json.dumps({"source": source})
@@ -563,8 +537,6 @@ def _trigger_session_start(session_id: str, is_resume: bool) -> str:
 def _trigger_precompact(session_id: str) -> None:
     """Forward precompact event so upstream can build a resume snapshot before compaction."""
     try:
-        import subprocess
-
         env = dict(os.environ)
         env["CLAUDE_SESSION_ID"] = session_id
         env["CLAUDE_PROJECT_DIR"] = os.getcwd()
