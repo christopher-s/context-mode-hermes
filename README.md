@@ -4,10 +4,11 @@ Transparently intercepts high-output tool calls in [Hermes Agent](https://github
 
 ## How it works
 
-Context Mode runs as an MCP server alongside Hermes. This plugin enforces its use through two hooks:
+Context Mode runs as an MCP server alongside Hermes. This plugin enforces its use through three hooks:
 
 1. **`pre_tool_call`** — Delegates every tool call to the Context Mode binary's `pretooluse` hook via subprocess. The binary contains all routing logic (safe-command allowlist, curl/wget detection, inline HTTP, build tools, WebFetch interception). When the binary returns a deny decision, the plugin blocks the call and tells the model to use `ctx_execute` instead.
-2. **`pre_llm_call`** — On the first turn of each session, injects routing rules (tool hierarchy, forbidden actions, output constraints) so the model knows sandbox tools exist and when to use them.
+2. **`post_tool_call`** — Forwards tool results to the Context Mode binary for session event tracking and byte accounting.
+3. **`pre_llm_call`** — On the first turn of each session, injects routing rules (tool hierarchy, forbidden actions, output constraints) so the model knows sandbox tools exist and when to use them. Also handles `/compact` and `/clear` by forwarding a precompact event so the binary can snapshot session state.
 
 ```
 Agent runs: terminal(command="curl https://api.example.com/data")
@@ -24,6 +25,18 @@ Agent runs: terminal(command="git status")
 ```
 
 The plugin enforces routing so the model uses Context Mode's MCP tools (`ctx_execute`, `ctx_batch_execute`, `ctx_search`, `ctx_fetch_and_index`, etc.) instead of raw Bash for high-output commands. All sandbox execution, pattern matching, and routing decisions live in the Context Mode binary — this plugin is a thin adapter that forwards decisions.
+
+## Hermes adapter via Claude Code hooks
+
+Context Mode ships native adapters for Claude Code, Cursor, VSCode Copilot, Codex, Gemini CLI, and other platforms. A native Hermes adapter does not exist yet. This plugin fills that gap by reusing context-mode's Claude Code hook interface.
+
+When Hermes triggers a hook, the plugin:
+
+1. Translates the Hermes tool call into the JSON payload format that Claude Code's hooks expect (`tool_name`, `tool_input`, `session_id`, `cwd`).
+2. Spawns `context-mode hook claude-code pretooluse` (or `posttooluse`, `sessionstart`, `precompact`) via subprocess, feeding the payload on stdin.
+3. Reads the JSON decision from stdout and maps the Claude Code permission format (`permissionDecision: deny/allow/ask`) back to Hermes format (`{"action": "block/ask"}` or `None` for passthrough).
+
+This approach inherits all routing logic from the binary — when context-mode updates its patterns, the plugin automatically benefits. The plugin's only job is format translation and lifecycle management.
 
 ## Installation
 
@@ -64,18 +77,9 @@ The Context Mode binary decides what to intercept. The plugin forwards every `te
 | Build tools (`gradle`, `mvn`, `cargo build`) | **Block** | `ctx_execute(language: "shell", code: "...")` |
 | `webfetch` / `WebFetch` | **Block** | `ctx_fetch_and_index(url, source)` then `ctx_search(queries)` |
 
-Short-output commands (git status, mkdir, ls, rm, mv) pass through untouched — they belong to RTK's compression layer instead.
+Short-output commands (git status, mkdir, ls, rm, mv) pass through untouched.
 
 The full routing rules live in the Context Mode binary and update automatically when you upgrade `context-mode` via npm.
-
-## Complementary to RTK
-
-RTK and Context Mode operate at different layers:
-
-- **RTK** rewrites short commands for token compression (`git log --stat` → `rtk git log --stat`). The command still runs through the normal terminal tool.
-- **Context Mode** intercepts high-output commands and routes them through a sandbox. The raw output stays out of context.
-
-Both plugins coexist on the `pre_tool_call` hook. RTK handles compression; Context Mode handles avoidance. The first block wins.
 
 ## Troubleshooting
 
@@ -96,7 +100,7 @@ pip install -e .[dev]   # installs pytest
 python -m pytest
 ```
 
-Tests mock the external `context-mode` binary and MCP server, so they run without a real Context Mode installation.
+Tests mock the external `context-mode` binary and MCP server, so they run without a real Context Mode installation. Integration tests (in `tests/test_integration.py`) exercise the real binary when available — they auto-skip if `context-mode` is not installed.
 
 ## License
 
