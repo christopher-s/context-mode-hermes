@@ -32,6 +32,14 @@ __version__ = "1.3.0"
 
 logger = logging.getLogger(__name__)
 
+_CONTEXT_MODE_STORAGE_ROOT = os.path.expanduser("~/.local/share/hermes-context-mode")
+
+def _context_mode_env() -> dict[str, str]:
+    """Return subprocess environment with storage outside retired client paths."""
+    env = dict(os.environ)
+    env.setdefault("CONTEXT_MODE_DIR", _CONTEXT_MODE_STORAGE_ROOT)
+    return env
+
 _ctx_available: Optional[bool] = None
 _mcp_ready: Optional[bool] = None
 
@@ -93,6 +101,7 @@ def _check_mcp_ready() -> bool:
             input=handshake,
             capture_output=True,
             text=True,
+            env=_context_mode_env(),
             timeout=5,
         )
         _mcp_ready = '"tools"' in result.stdout and result.returncode == 0
@@ -322,7 +331,7 @@ def _route_via_hook(tool_name: str, args: dict, session_id: str) -> Optional[dic
             "cwd": os.getcwd(),
         })
 
-        env = dict(os.environ)
+        env = _context_mode_env()
         env["CLAUDE_SESSION_ID"] = session_id
         env["CLAUDE_PROJECT_DIR"] = os.getcwd()
 
@@ -427,7 +436,7 @@ def _post_tool_call(
             "tool_response": result
         })
         
-        env = dict(os.environ)
+        env = _context_mode_env()
         env["CLAUDE_SESSION_ID"] = session_id
         env["CLAUDE_PROJECT_DIR"] = os.getcwd()
         
@@ -514,7 +523,7 @@ def _on_session_reset(*, session_id: str = "", **_kwargs) -> None:
 def _trigger_session_start(session_id: str, is_resume: bool) -> str:
     """Trigger upstream SessionStart to generate auto-injection logic."""
     try:
-        env = dict(os.environ)
+        env = _context_mode_env()
         env["CLAUDE_SESSION_ID"] = session_id
         env["CLAUDE_PROJECT_DIR"] = os.getcwd()
 
@@ -543,7 +552,7 @@ def _trigger_session_start(session_id: str, is_resume: bool) -> str:
 def _trigger_precompact(session_id: str) -> None:
     """Forward precompact event so upstream can build a resume snapshot before compaction."""
     try:
-        env = dict(os.environ)
+        env = _context_mode_env()
         env["CLAUDE_SESSION_ID"] = session_id
         env["CLAUDE_PROJECT_DIR"] = os.getcwd()
 
