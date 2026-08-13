@@ -1,2 +1,0 @@
-0b4c96deba3d3d33269542c24a7f4843f0681efc
-git clone --depth 1 https://github.com/mksglu/context-mode .reference/context-mode-upstream

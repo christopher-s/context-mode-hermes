@@ -30,3 +30,6 @@ htmlcov/
 
 # Reference-only upstream checkouts
 .reference/
+
+# Agent planning and evidence artifacts
+.sisyphus/
