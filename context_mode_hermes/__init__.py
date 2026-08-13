@@ -28,7 +28,7 @@ import tempfile
 import time
 from typing import Optional
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 logger = logging.getLogger(__name__)
 
@@ -589,29 +589,3 @@ def register(ctx) -> None:
     logger.info(
         "[context-mode] Hermes plugin registered (pre_tool_call + post_tool_call + pre_llm_call + session_lifecycle)"
     )
-
-
-class _ModuleProxy:
-    """Wrapper that exposes register() as an attribute.
-
-    Hermes calls getattr(module, "register") after ep.load().
-    When the entry point references a function directly, ep.load()
-    returns the function itself, which has no "register" attribute.
-    This wrapper delegates attribute access to the underlying function
-    so both module.register and module.register(ctx) work.
-    """
-
-    def __init__(self, fn):
-        self._fn = fn
-
-    def __call__(self, *args, **kwargs):
-        return self._fn(*args, **kwargs)
-
-    def __getattr__(self, name):
-        if name == "register":
-            return self._fn
-        raise AttributeError(name)
-
-
-# Wrap the register function so it survives getattr(module, "register")
-register = _ModuleProxy(register)
