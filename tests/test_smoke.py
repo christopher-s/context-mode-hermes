@@ -14,10 +14,11 @@ def test_plugin_smoke():
 
 
 def test_entry_point_loads_module_for_loader_compatibility():
+    distribution = importlib.metadata.distribution("context-mode-hermes")
     entry_point = next(
         ep
-        for ep in importlib.metadata.entry_points().select(group="hermes_agent.plugins")
-        if ep.name == "context-mode"
+        for ep in distribution.entry_points
+        if ep.group == "hermes_agent.plugins" and ep.name == "context-mode"
     )
     loaded = entry_point.load()
 
